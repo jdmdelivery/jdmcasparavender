@@ -105,8 +105,9 @@ if (not _db_url_raw) or (_db_url_raw.lower() in ("null", "none")):
 else:
     DATABASE_URL = _db_url_raw
 
-# When no PostgreSQL is configured, enable a lightweight demo mode.
-DEMO_MODE = DATABASE_URL_IS_FALLBACK or (psycopg2 is None)
+# Demo mode is OPTIONAL. Normal mode requires a database.
+# Set DEMO_MODE=1 in environment to enable in-memory demo.
+DEMO_MODE = (os.getenv("DEMO_MODE", "").strip() == "1")
 
 # In-memory demo storage (no external DB). Resets on deploy/restart.
 DEMO_DB = {
@@ -127,19 +128,43 @@ app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 # Friendly response instead of 500 when DB isn't configured.
 @app.errorhandler(DatabaseNotConfigured)
 def _handle_db_not_configured(_err):
+    body = """
+    <div class="card">
+      <h2>Base de datos no configurada</h2>
+      <p>
+        Esta instalación está corriendo sin <b>DATABASE_URL</b>.
+        Puedes ver el sistema y navegar los botones, pero para guardar datos
+        (clientes, préstamos, pagos, reportes) necesitas configurar una base de datos.
+      </p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+        <a class="btn btn-secondary" href="/time">Ver hora del servidor</a>
+        <a class="btn btn-secondary" href="/logout">Cerrar sesión</a>
+      </div>
+    </div>
+    """
+
+    # If the full layout is available (later in file), render inside it
+    # so the sidebar/menu/buttons remain visible for "showcase" mode.
+    if "TPL_LAYOUT" in globals():
+        return (
+            render_template_string(
+                TPL_LAYOUT,
+                body=body,
+                user=current_user(),
+                flashes=get_flashed_messages(with_categories=True),
+                admin_whatsapp=ADMIN_WHATSAPP,
+                app_brand=APP_BRAND,
+                theme=get_theme(),
+            ),
+            503,
+        )
+
+    # Fallback early during import (before TPL_LAYOUT exists).
     return (
         render_template_string(
-            """
-            <div style="max-width:720px;margin:40px auto;font-family:system-ui;padding:20px">
-              <h2 style="margin:0 0 10px 0">Base de datos no configurada</h2>
-              <p style="margin:0 0 14px 0">
-                Esta instalación está corriendo sin <b>DATABASE_URL</b>.
-                Para usar login, préstamos, pagos y reportes necesitas configurar la base de datos.
-              </p>
-              <p style="margin:0 0 14px 0">
-                En Render: agrega <b>DATABASE_URL</b> (PostgreSQL) en Environment Variables.
-              </p>
-              <p style="margin:0"><a href="/time">Ver hora del servidor</a></p>
+            f"""
+            <div style="max-width:900px;margin:40px auto;font-family:system-ui;padding:20px">
+              {body}
             </div>
             """
         ),
@@ -1351,6 +1376,7 @@ def login():
                 admin_whatsapp=ADMIN_WHATSAPP,
             )
 
+        # Normal mode: requires DB
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
 
@@ -10456,8 +10482,6 @@ def forgot_password():
 @app.route("/")
 @login_required
 def index():
-    if DEMO_MODE:
-        return redirect(url_for("demo_dashboard"))
     return redirect(url_for("dashboard"))
 
 # ============================================================

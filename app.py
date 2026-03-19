@@ -42,18 +42,27 @@ from flask import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 
-import psycopg2
-import psycopg2.extras
+# psycopg2 is optional when running without DATABASE_URL.
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 
 # ===============================
 # ZONA HORARIA OFICIAL DEL SISTEMA (RD DEFINITIVA)
 # ===============================
 UTC = pytz.utc
-RD_TZ = pytz.timezone("America/Santo_Domingo")
+TIMEZONE = pytz.timezone("America/Santo_Domingo")
+RD_TZ = TIMEZONE
+
+def now_dr():
+    """Hora actual en República Dominicana (aware)."""
+    return datetime.now(TIMEZONE)
 
 def utc_now():
-    """Hora actual en UTC (para guardar en DB)"""
-    return datetime.utcnow()
+    """Compat: antes retornaba UTC; ahora estandarizamos a RD."""
+    return now_dr()
 
 def to_rd(dt):
     """Convierte una fecha UTC a hora RD"""
@@ -82,14 +91,23 @@ ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 
 # URL de la base de datos (Render)
 DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL_IS_FALLBACK = False
 if not DATABASE_URL:
-    raise RuntimeError("❌ ERROR: Falta la DATABASE_URL en Render → Environment.")
+    # Use ASCII-only logging to avoid Windows console UnicodeEncodeError.
+    print("WARNING: No DATABASE_URL found. Using SQLite instead.")
+    DATABASE_URL = "sqlite:///local.db"
+    DATABASE_URL_IS_FALLBACK = True
 
 # =============================
 # CREAR APP FLASK
 # =============================
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
+
+# Optional: quick timezone check
+@app.route("/time")
+def get_time():
+    return {"time": now_dr().strftime("%Y-%m-%d %H:%M:%S")}
 
 # =============================
 # CONFIGURACIÓN SUBIR FOTOS
@@ -109,15 +127,25 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 # =============================
 # CONEXIÓN A BASE DE DATOS
 # =============================
-import psycopg2
-import psycopg2.extras
-
 def get_conn():
-    return psycopg2.connect(
+    if DATABASE_URL_IS_FALLBACK:
+        raise RuntimeError("DATABASE_URL missing; app running without database.")
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 not installed; set DATABASE_URL for PostgreSQL.")
+
+    conn = psycopg2.connect(
         DATABASE_URL,
         sslmode="require",
-        cursor_factory=psycopg2.extras.RealDictCursor
+        cursor_factory=psycopg2.extras.RealDictCursor,
     )
+    # Force session timezone so DB-side NOW()/CURRENT_TIMESTAMP match DR time.
+    try:
+        cur = conn.cursor()
+        cur.execute("SET TIME ZONE 'America/Santo_Domingo';")
+        cur.close()
+    except Exception:
+        pass
+    return conn
 
 # ============================================================
 # 🔄 GENERAR CUOTAS ATRASADAS AUTOMÁTICO (CORREGIDO)
@@ -229,7 +257,8 @@ def fix_cash_reports_schema():
 
 
 # 🔹 EJECUTAR AUTOMÁTICAMENTE AL INICIAR LA APP
-fix_cash_reports_schema()
+if not DATABASE_URL_IS_FALLBACK and psycopg2 is not None:
+    fix_cash_reports_schema()
 
 
 
@@ -407,7 +436,7 @@ def init_db():
                 "admin",
                 generate_password_hash("admin"),
                 "admin",
-                datetime.utcnow(),
+                now_dr(),
             ))
             print("✔ Usuario admin creado (user=admin, pass=admin)")
 
@@ -1088,7 +1117,8 @@ def ensure_users_phone_column():
 
 
 # 🔥 EJECUTAR AL ARRANCAR LA APP
-ensure_users_phone_column()
+if not DATABASE_URL_IS_FALLBACK and psycopg2 is not None:
+    ensure_users_phone_column()
 
 
 
@@ -1952,7 +1982,7 @@ def new_user():
             cur.execute("""
                 INSERT INTO users (username, password_hash, role, phone, created_at)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (username, pwd, role, phone, datetime.utcnow()))
+            """, (username, pwd, role, phone, now_dr()))
             conn.commit()
             flash("Usuario creado correctamente.", "success")
 
@@ -3438,8 +3468,10 @@ def loans():
 
 from datetime import datetime, date
 
-
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 # ============================================================
 # 💰 CREAR PRÉSTAMO — FINANCIERO REAL CORREGIDO
@@ -5292,8 +5324,10 @@ def bank_legal_list():
 
 from flask import Response
 
-
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 # ============================================================
 # 📄 VER DOCUMENTO LEGAL + CÉDULA + FIRMA (TODO EN BD)
@@ -9042,7 +9076,10 @@ def collector_map():
 
 from datetime import date, timedelta
 from flask import render_template_string, get_flashed_messages
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 @app.route("/bank/cobro-sabado")
 @login_required
@@ -9785,7 +9822,10 @@ def borrar_cierre(cierre_id):
 # ============================================================
 
 import os
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 from flask import request, redirect, flash, render_template_string, get_flashed_messages
 
 
@@ -10101,7 +10141,7 @@ def admin_force_create():
         "admin",
         generate_password_hash("admin"),
         "admin",
-        datetime.utcnow()
+        now_dr()
     ))
 
     conn.commit()

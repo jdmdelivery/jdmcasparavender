@@ -140,6 +140,7 @@ def get_conn():
         DATABASE_URL,
         sslmode="require",
         cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=5,
     )
     # Force session timezone so DB-side NOW()/CURRENT_TIMESTAMP match DR time.
     try:
@@ -247,16 +248,28 @@ def ensure_legal_columns():
 def fix_cash_reports_schema():
     conn = get_conn()
     cur = conn.cursor()
-
-    cur.execute("""
-        ALTER TABLE cash_reports
-        ADD COLUMN IF NOT EXISTS client_id INTEGER,
-        ADD COLUMN IF NOT EXISTS route_id INTEGER;
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute("""
+            ALTER TABLE cash_reports
+            ADD COLUMN IF NOT EXISTS client_id INTEGER,
+            ADD COLUMN IF NOT EXISTS route_id INTEGER;
+        """)
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("WARNING: fix_cash_reports_schema() skipped:", str(e))
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # 🔹 EJECUTAR AUTOMÁTICAMENTE AL INICIAR LA APP
@@ -1112,11 +1125,20 @@ def ensure_users_phone_column():
         conn.commit()
         print("✔ Columna phone verificada en users")
     except Exception as e:
-        conn.rollback()
-        print("⚠ Error asegurando columna phone:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("WARNING: ensure_users_phone_column() skipped:", str(e))
     finally:
-        cur.close()
-        conn.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # 🔥 EJECUTAR AL ARRANCAR LA APP

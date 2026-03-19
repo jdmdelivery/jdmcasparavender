@@ -49,6 +49,10 @@ try:
 except ImportError:
     psycopg2 = None
 
+
+class DatabaseNotConfigured(RuntimeError):
+    pass
+
 # ===============================
 # ZONA HORARIA OFICIAL DEL SISTEMA (RD DEFINITIVA)
 # ===============================
@@ -107,6 +111,28 @@ else:
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 
+# Friendly response instead of 500 when DB isn't configured.
+@app.errorhandler(DatabaseNotConfigured)
+def _handle_db_not_configured(_err):
+    return (
+        render_template_string(
+            """
+            <div style="max-width:720px;margin:40px auto;font-family:system-ui;padding:20px">
+              <h2 style="margin:0 0 10px 0">Base de datos no configurada</h2>
+              <p style="margin:0 0 14px 0">
+                Esta instalación está corriendo sin <b>DATABASE_URL</b>.
+                Para usar login, préstamos, pagos y reportes necesitas configurar la base de datos.
+              </p>
+              <p style="margin:0 0 14px 0">
+                En Render: agrega <b>DATABASE_URL</b> (PostgreSQL) en Environment Variables.
+              </p>
+              <p style="margin:0"><a href="/time">Ver hora del servidor</a></p>
+            </div>
+            """
+        ),
+        503,
+    )
+
 # Optional: quick timezone check
 @app.route("/time")
 def get_time():
@@ -132,9 +158,9 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 # =============================
 def get_conn():
     if DATABASE_URL_IS_FALLBACK:
-        raise RuntimeError("DATABASE_URL missing; app running without database.")
+        raise DatabaseNotConfigured("DATABASE_URL missing; app running without database.")
     if psycopg2 is None:
-        raise RuntimeError("psycopg2 not installed; set DATABASE_URL for PostgreSQL.")
+        raise DatabaseNotConfigured("psycopg2 not installed; set DATABASE_URL for PostgreSQL.")
 
     conn = psycopg2.connect(
         DATABASE_URL,
@@ -1278,6 +1304,9 @@ button {
 def login():
 
     if request.method == "POST":
+        if DATABASE_URL_IS_FALLBACK or psycopg2 is None:
+            raise DatabaseNotConfigured("Login requires a configured PostgreSQL database.")
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
 

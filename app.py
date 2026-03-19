@@ -105,6 +105,9 @@ if (not _db_url_raw) or (_db_url_raw.lower() in ("null", "none")):
 else:
     DATABASE_URL = _db_url_raw
 
+# When no PostgreSQL is configured, enable a lightweight demo mode.
+DEMO_MODE = DATABASE_URL_IS_FALLBACK or (psycopg2 is None)
+
 # =============================
 # CREAR APP FLASK
 # =============================
@@ -493,6 +496,8 @@ def init_db():
 # ============================================================
 
 def current_user():
+    if DEMO_MODE:
+        return session.get("demo_user")
     uid = session.get("user_id")
     if not uid:
         return None
@@ -508,6 +513,12 @@ def current_user():
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if DEMO_MODE:
+            if not session.get("demo_user"):
+                flash("Debe iniciar sesión primero.", "warning")
+                return redirect(url_for("login"))
+            return fn(*args, **kwargs)
+
         if not session.get("user_id"):
             flash("Debe iniciar sesión primero.", "warning")
             return redirect(url_for("login"))
@@ -533,6 +544,8 @@ def admin_required(fn):
 
 
 def log_action(user_id, action, detail=""):
+    if DEMO_MODE:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -1304,8 +1317,29 @@ button {
 def login():
 
     if request.method == "POST":
-        if DATABASE_URL_IS_FALLBACK or psycopg2 is None:
-            raise DatabaseNotConfigured("Login requires a configured PostgreSQL database.")
+        if DEMO_MODE:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "").strip()
+
+            if username == "admin" and password == "admin":
+                session.clear()
+                session["demo_user"] = {
+                    "id": 0,
+                    "username": "admin",
+                    "role": "admin",
+                    "phone": "",
+                    "name": "Admin Demo",
+                }
+                flash("Modo demo: datos no se guardan (sin base de datos).", "warning")
+                return redirect(url_for("demo_dashboard"))
+
+            flash("Usuario o contraseña incorrectos.", "danger")
+            return render_template_string(
+                TPL_LOGIN,
+                flashes=get_flashed_messages(with_categories=True),
+                app_brand=APP_BRAND,
+                admin_whatsapp=ADMIN_WHATSAPP,
+            )
 
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
@@ -1356,6 +1390,31 @@ def login():
         flashes=get_flashed_messages(with_categories=True),
         app_brand=APP_BRAND,
         admin_whatsapp=ADMIN_WHATSAPP
+    )
+
+
+@app.route("/demo")
+@login_required
+def demo_dashboard():
+    user = current_user()
+    body = """
+    <div class="card">
+      <h2>Modo demo (sin base de datos)</h2>
+      <p>Estás viendo la app sin PostgreSQL. Puedes navegar la interfaz, pero <b>no se guardará nada</b>.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+        <a class="btn btn-primary" href="/time">Ver hora (RD)</a>
+        <a class="btn btn-secondary" href="/logout">Cerrar sesión</a>
+      </div>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
     )
 
 
@@ -10176,6 +10235,8 @@ def forgot_password():
 @app.route("/")
 @login_required
 def index():
+    if DEMO_MODE:
+        return redirect(url_for("demo_dashboard"))
     return redirect(url_for("dashboard"))
 
 # ============================================================

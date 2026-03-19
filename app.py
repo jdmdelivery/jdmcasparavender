@@ -43,23 +43,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.exceptions import HTTPException
 from functools import wraps
 
-# No-database mode: make all DB imports optional and never fatal.
+# psycopg2 is optional only when demo mode is enabled.
 try:
-    import psycopg2  # type: ignore
-    import psycopg2.extras  # type: ignore
-except Exception:
-    class _Psycopg2Stub:
-        class errors:
-            UniqueViolation = Exception
-
-        class extras:
-            RealDictCursor = object
-
-    psycopg2 = _Psycopg2Stub()  # type: ignore
-
-
-NO_DATABASE_MODE = True
-print("Running in no-database mode")
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 
 # ===============================
 # ZONA HORARIA OFICIAL DEL SISTEMA (RD DEFINITIVA)
@@ -101,10 +90,11 @@ CURRENCY = "RD$"
 # WhatsApp SOS / recuperación
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 
-# No DATABASE_URL required in Render. App always runs without DB.
-DATABASE_URL = None
+# No-BD mode requested: run app without PostgreSQL.
+DATABASE_URL = ""
 DATABASE_URL_IS_FALLBACK = True
 DEMO_MODE = True
+print("Running in no-database mode")
 
 # In-memory demo storage (no external DB). Resets on deploy/restart.
 DEMO_DB = {
@@ -129,7 +119,7 @@ DEMO_METRICS = {
     "total_empleados": 0,
 }
 
-# Seed demo admin (admin/admin) so login works without DB.
+# Seed demo admin (admin/admin) for optional demo mode.
 if not any(u.get("username") == "admin" for u in DEMO_DB["users"]):
     DEMO_DB["users"].append(
         {
@@ -158,8 +148,28 @@ class DatabaseNotConfigured(RuntimeError):
 
 @app.errorhandler(DatabaseNotConfigured)
 def _handle_db_not_configured(_err):
-    # In no-database mode, never block navigation.
-    return redirect(url_for("demo_dashboard"))
+    if DEMO_MODE:
+        return redirect(url_for("panel_dashboard"))
+    body = """
+    <div class="card">
+      <h2>Base de datos no configurada</h2>
+      <p>Configura <b>DATABASE_URL</b> para usar el sistema normal.</p>
+    </div>
+    """
+    if "TPL_LAYOUT" in globals():
+        return (
+            render_template_string(
+                TPL_LAYOUT,
+                body=body,
+                user=current_user() if "current_user" in globals() else None,
+                flashes=get_flashed_messages(with_categories=True),
+                admin_whatsapp=ADMIN_WHATSAPP,
+                app_brand=APP_BRAND,
+                theme="light",
+            ),
+            503,
+        )
+    return render_template_string(body), 503
 
 
 def _render_demo_module(path: str, status_code: int = 200):
@@ -167,13 +177,13 @@ def _render_demo_module(path: str, status_code: int = 200):
     pretty = title.replace("-", " ").replace("/", " / ").title()
     body = f"""
     <div class="card">
-      <h2>{pretty} (Demo)</h2>
-      <p>Este módulo está visible en modo demo sin base de datos.</p>
+      <h2>{pretty}</h2>
+      <p>Este módulo está disponible en modo local sin base de datos.</p>
       <p>Aquí puedes mostrar flujo, diseño y botones sin guardar información real.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
         <a class="btn btn-primary" href="/dashboard">Ir al Dashboard</a>
-        <a class="btn btn-secondary" href="/demo/clients">Clientes Demo</a>
-        <a class="btn btn-secondary" href="/demo/loans">Préstamos Demo</a>
+        <a class="btn btn-secondary" href="/clientes-local">Clientes</a>
+        <a class="btn btn-secondary" href="/prestamos-local">Préstamos</a>
       </div>
     </div>
     """
@@ -466,8 +476,8 @@ def fix_cash_reports_schema():
 
 
 # 🔹 EJECUTAR AUTOMÁTICAMENTE AL INICIAR LA APP
-# no-db mode: safe no-op (FakeConn accepts it)
-fix_cash_reports_schema()
+if not DATABASE_URL_IS_FALLBACK and psycopg2 is not None:
+    fix_cash_reports_schema()
 
 
 
@@ -1345,7 +1355,8 @@ def ensure_users_phone_column():
 
 
 # 🔥 EJECUTAR AL ARRANCAR LA APP
-ensure_users_phone_column()
+if not DATABASE_URL_IS_FALLBACK and psycopg2 is not None:
+    ensure_users_phone_column()
 
 
 
@@ -1487,14 +1498,18 @@ def login():
             if username == "admin" and password == "admin":
                 session.clear()
                 session["demo_user"] = {
-                    "id": 0,
+                    "id": 1,
                     "username": "admin",
                     "role": "admin",
                     "phone": "",
-                    "name": "Admin Demo",
+                    "name": "Admin",
+                    "organization_id": 1,
                 }
-                flash("Modo demo: datos no se guardan (sin base de datos).", "warning")
-                return redirect(url_for("demo_dashboard"))
+                session["user_id"] = 1
+                session["role"] = "admin"
+                session["org_id"] = 1
+                flash("Modo local activo: datos temporales.", "warning")
+                return redirect(url_for("dashboard"))
 
             flash("Usuario o contraseña incorrectos.", "danger")
             return render_template_string(
@@ -1557,17 +1572,18 @@ def login():
     )
 
 
+@app.route("/panel")
 @app.route("/demo")
 @login_required
-def demo_dashboard():
+def panel_dashboard():
     user = current_user()
     body = """
     <div class="card">
-      <h2>Modo demo (sin base de datos)</h2>
+      <h2>Panel principal</h2>
       <p>Estás viendo la app sin PostgreSQL. Puedes navegar la interfaz, pero <b>no se guardará nada</b>.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
-        <a class="btn btn-primary" href="/demo/clients">Clientes (demo)</a>
-        <a class="btn btn-primary" href="/demo/loans">Préstamos (demo)</a>
+        <a class="btn btn-primary" href="/clientes-local">Clientes</a>
+        <a class="btn btn-primary" href="/prestamos-local">Préstamos</a>
         <a class="btn btn-secondary" href="/time">Ver hora (RD)</a>
         <a class="btn btn-secondary" href="/logout">Cerrar sesión</a>
       </div>
@@ -1584,6 +1600,7 @@ def demo_dashboard():
     )
 
 
+@app.route("/clientes-local")
 @app.route("/demo/clients")
 @login_required
 def demo_clients():
@@ -1604,11 +1621,11 @@ def demo_clients():
 
     body = f"""
     <div class="card">
-      <h2>Clientes (demo)</h2>
+      <h2>Clientes</h2>
       <p style="margin-top:-6px;color:#475569;">Estos datos son temporales (se borran al reiniciar).</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
-        <a class="btn btn-primary" href="/demo/clients/new">+ Nuevo cliente</a>
-        <a class="btn btn-secondary" href="/demo">Volver</a>
+        <a class="btn btn-primary" href="/clientes-local/nuevo">+ Nuevo cliente</a>
+        <a class="btn btn-secondary" href="/panel">Volver</a>
       </div>
       <table>
         <tr><th>ID</th><th>Nombre</th><th>Apellido</th><th>Teléfono</th><th>Creado</th></tr>
@@ -1627,6 +1644,7 @@ def demo_clients():
     )
 
 
+@app.route("/clientes-local/nuevo", methods=["GET", "POST"])
 @app.route("/demo/clients/new", methods=["GET", "POST"])
 @login_required
 def demo_clients_new():
@@ -1651,12 +1669,12 @@ def demo_clients_new():
                     "created_at": now_dr().strftime("%Y-%m-%d %H:%M:%S"),
                 }
             )
-            flash("Cliente creado (demo).", "success")
+            flash("Cliente creado.", "success")
             return redirect(url_for("demo_clients"))
 
     body = """
     <div class="card">
-      <h2>+ Nuevo cliente (demo)</h2>
+      <h2>+ Nuevo cliente</h2>
       <form method="post" style="display:grid;gap:10px;max-width:520px;">
         <div><label>Nombre</label><input name="first_name" required></div>
         <div><label>Apellido</label><input name="last_name"></div>
@@ -1664,7 +1682,7 @@ def demo_clients_new():
         <div><label>Dirección</label><input name="address"></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-secondary" href="/demo/clients">Cancelar</a>
+          <a class="btn btn-secondary" href="/clientes-local">Cancelar</a>
         </div>
       </form>
     </div>
@@ -1680,6 +1698,7 @@ def demo_clients_new():
     )
 
 
+@app.route("/prestamos-local")
 @app.route("/demo/loans")
 @login_required
 def demo_loans():
@@ -1702,11 +1721,11 @@ def demo_loans():
 
     body = f"""
     <div class="card">
-      <h2>Préstamos (demo)</h2>
+      <h2>Préstamos</h2>
       <p style="margin-top:-6px;color:#475569;">Temporales (se borran al reiniciar).</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
-        <a class="btn btn-primary" href="/demo/loans/new">+ Nuevo préstamo</a>
-        <a class="btn btn-secondary" href="/demo">Volver</a>
+        <a class="btn btn-primary" href="/prestamos-local/nuevo">+ Nuevo préstamo</a>
+        <a class="btn btn-secondary" href="/panel">Volver</a>
       </div>
       <table>
         <tr><th>ID</th><th>Cliente</th><th>Monto</th><th>Inicio</th><th>Status</th></tr>
@@ -1725,6 +1744,7 @@ def demo_loans():
     )
 
 
+@app.route("/prestamos-local/nuevo", methods=["GET", "POST"])
 @app.route("/demo/loans/new", methods=["GET", "POST"])
 @login_required
 def demo_loans_new():
@@ -1755,7 +1775,7 @@ def demo_loans_new():
                     "status": "activo",
                 }
             )
-            flash("Préstamo creado (demo).", "success")
+            flash("Préstamo creado.", "success")
             return redirect(url_for("demo_loans"))
 
     options = "<option value=''>-- Seleccionar --</option>"
@@ -1765,19 +1785,19 @@ def demo_loans_new():
 
     body = f"""
     <div class="card">
-      <h2>+ Nuevo préstamo (demo)</h2>
+      <h2>+ Nuevo préstamo</h2>
       <form method="post" style="display:grid;gap:10px;max-width:520px;">
         <div>
           <label>Cliente</label>
           <select name="client_id" required>{options}</select>
           <div style="margin-top:6px;">
-            <a href="/demo/clients/new" style="font-size:13px;">Crear cliente primero</a>
+            <a href="/clientes-local/nuevo" style="font-size:13px;">Crear cliente primero</a>
           </div>
         </div>
         <div><label>Monto</label><input name="amount" inputmode="decimal" placeholder="1000" required></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-secondary" href="/demo/loans">Cancelar</a>
+          <a class="btn btn-secondary" href="/prestamos-local">Cancelar</a>
         </div>
       </form>
     </div>

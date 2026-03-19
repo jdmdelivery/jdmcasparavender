@@ -92,11 +92,14 @@ ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 # URL de la base de datos (Render)
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_URL_IS_FALLBACK = False
-if not DATABASE_URL:
+_db_url_raw = (DATABASE_URL or "").strip()
+if (not _db_url_raw) or (_db_url_raw.lower() in ("null", "none")):
     # Use ASCII-only logging to avoid Windows console UnicodeEncodeError.
     print("WARNING: No DATABASE_URL found. Using SQLite instead.")
     DATABASE_URL = "sqlite:///local.db"
     DATABASE_URL_IS_FALLBACK = True
+else:
+    DATABASE_URL = _db_url_raw
 
 # =============================
 # CREAR APP FLASK

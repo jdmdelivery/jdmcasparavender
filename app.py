@@ -42,18 +42,38 @@ from flask import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 
-import psycopg2
-import psycopg2.extras
+# No-database mode: make all DB imports optional and never fatal.
+try:
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+except Exception:
+    class _Psycopg2Stub:
+        class errors:
+            UniqueViolation = Exception
+
+        class extras:
+            RealDictCursor = object
+
+    psycopg2 = _Psycopg2Stub()  # type: ignore
+
+
+NO_DATABASE_MODE = True
+print("Running in no-database mode")
 
 # ===============================
 # ZONA HORARIA OFICIAL DEL SISTEMA (RD DEFINITIVA)
 # ===============================
 UTC = pytz.utc
-RD_TZ = pytz.timezone("America/Santo_Domingo")
+TIMEZONE = pytz.timezone("America/Santo_Domingo")
+RD_TZ = TIMEZONE
+
+def now_dr():
+    """Hora actual en República Dominicana (aware)."""
+    return datetime.now(TIMEZONE)
 
 def utc_now():
-    """Hora actual en UTC (para guardar en DB)"""
-    return datetime.utcnow()
+    """Compat: antes retornaba UTC; ahora estandarizamos a RD."""
+    return now_dr()
 
 def to_rd(dt):
     """Convierte una fecha UTC a hora RD"""
@@ -80,10 +100,35 @@ CURRENCY = "RD$"
 # WhatsApp SOS / recuperación
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 
-# URL de la base de datos (Render)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("❌ ERROR: Falta la DATABASE_URL en Render → Environment.")
+# No DATABASE_URL required in Render. App always runs without DB.
+DATABASE_URL = None
+DATABASE_URL_IS_FALLBACK = True
+DEMO_MODE = True
+
+# In-memory demo storage (no external DB). Resets on deploy/restart.
+DEMO_DB = {
+    "clients": [],  # {id, first_name, last_name, phone, address, created_at}
+    "loans": [],    # {id, client_id, amount, start_date, status}
+    "users": [],    # {id, username, password_hash, role, phone, created_at, name}
+}
+
+# Seed demo admin (admin/admin) so login works without DB.
+if not any(u.get("username") == "admin" for u in DEMO_DB["users"]):
+    DEMO_DB["users"].append(
+        {
+            "id": 1,
+            "username": "admin",
+            "password_hash": generate_password_hash("admin"),
+            "role": "admin",
+            "phone": "",
+            "created_at": now_dr(),
+            "name": "Admin",
+        }
+    )
+
+def _demo_next_id(table: str) -> int:
+    rows = DEMO_DB.get(table, [])
+    return (max((r["id"] for r in rows), default=0) + 1) if rows else 1
 
 # =============================
 # CREAR APP FLASK
@@ -91,19 +136,126 @@ if not DATABASE_URL:
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 
+class DatabaseNotConfigured(RuntimeError):
+    pass
+
+@app.errorhandler(DatabaseNotConfigured)
+def _handle_db_not_configured(_err):
+    # In no-database mode, never block navigation.
+    return redirect(url_for("demo_dashboard"))
+
+# Optional: quick timezone check
+@app.route("/time")
+def get_time():
+    return {"time": now_dr().strftime("%Y-%m-%d %H:%M:%S")}
+
+# =============================
+# CONFIGURACIÓN SUBIR FOTOS
+# =============================
+from werkzeug.utils import secure_filename
+import time
+
+UPLOAD_FOLDER = "static/uploads"
+
+# crear carpeta automáticamente
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# guardar ruta en Flask
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
 
 # =============================
 # CONEXIÓN A BASE DE DATOS
 # =============================
-import psycopg2
-import psycopg2.extras
-
 def get_conn():
-    return psycopg2.connect(
-        DATABASE_URL,
-        sslmode="require",
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
+    return FakeConn()
+
+
+class FakeConn:
+    def __init__(self):
+        self.closed = False
+
+    def cursor(self, cursor_factory=None):
+        return FakeCursor()
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class FakeCursor:
+    def __init__(self):
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        s = " ".join((sql or "").split()).lower()
+        params = params or ()
+
+        # Minimal routing for common auth/user flows
+        if "select count(*) as c from users" in s:
+            self._rows = [{"c": len(DEMO_DB.get("users", []))}]
+            return
+
+        if "select * from users where username" in s:
+            username = params[0] if params else ""
+            for u in DEMO_DB.setdefault("users", []):
+                if u.get("username") == username:
+                    self._rows = [u]
+                    return
+            self._rows = []
+            return
+
+        if "select * from users where id" in s:
+            uid = params[0] if params else None
+            for u in DEMO_DB.setdefault("users", []):
+                if u.get("id") == uid:
+                    self._rows = [u]
+                    return
+            self._rows = []
+            return
+
+        if s.startswith("insert into users"):
+            # values (%s, %s, %s, %s) or similar
+            users = DEMO_DB.setdefault("users", [])
+            uid = _demo_next_id("users")
+            username = params[0] if len(params) > 0 else "user"
+            password_hash = params[1] if len(params) > 1 else generate_password_hash("admin")
+            role = params[2] if len(params) > 2 else "admin"
+            created_at = params[-1] if params else now_dr()
+            phone = params[3] if len(params) > 3 else ""
+            users.append(
+                {
+                    "id": uid,
+                    "username": username,
+                    "password_hash": password_hash,
+                    "role": role,
+                    "phone": phone,
+                    "created_at": created_at,
+                    "name": username,
+                }
+            )
+            self._rows = []
+            return
+
+        # Generic no-op: return empty set for SELECT, accept writes.
+        if s.startswith("select"):
+            self._rows = []
+        else:
+            self._rows = []
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows or [])
+
+    def close(self):
+        return None
 
 # ============================================================
 # 🔄 GENERAR CUOTAS ATRASADAS AUTOMÁTICO (CORREGIDO)
@@ -202,19 +354,32 @@ def ensure_legal_columns():
 def fix_cash_reports_schema():
     conn = get_conn()
     cur = conn.cursor()
-
-    cur.execute("""
-        ALTER TABLE cash_reports
-        ADD COLUMN IF NOT EXISTS client_id INTEGER,
-        ADD COLUMN IF NOT EXISTS route_id INTEGER;
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute("""
+            ALTER TABLE cash_reports
+            ADD COLUMN IF NOT EXISTS client_id INTEGER,
+            ADD COLUMN IF NOT EXISTS route_id INTEGER;
+        """)
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("WARNING: fix_cash_reports_schema() skipped:", str(e))
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # 🔹 EJECUTAR AUTOMÁTICAMENTE AL INICIAR LA APP
+# no-db mode: safe no-op (FakeConn accepts it)
 fix_cash_reports_schema()
 
 
@@ -393,7 +558,7 @@ def init_db():
                 "admin",
                 generate_password_hash("admin"),
                 "admin",
-                datetime.utcnow(),
+                now_dr(),
             ))
             print("✔ Usuario admin creado (user=admin, pass=admin)")
 
@@ -408,6 +573,8 @@ def init_db():
 # ============================================================
 
 def current_user():
+    if DEMO_MODE:
+        return session.get("demo_user")
     uid = session.get("user_id")
     if not uid:
         return None
@@ -423,6 +590,12 @@ def current_user():
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if DEMO_MODE:
+            if not session.get("demo_user"):
+                flash("Debe iniciar sesión primero.", "warning")
+                return redirect(url_for("login"))
+            return fn(*args, **kwargs)
+
         if not session.get("user_id"):
             flash("Debe iniciar sesión primero.", "warning")
             return redirect(url_for("login"))
@@ -448,6 +621,8 @@ def admin_required(fn):
 
 
 def log_action(user_id, action, detail=""):
+    if DEMO_MODE:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -1064,13 +1239,22 @@ def ensure_users_phone_column():
             ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
         """)
         conn.commit()
-        print("✔ Columna phone verificada en users")
+        print("OK: Columna phone verificada en users")
     except Exception as e:
-        conn.rollback()
-        print("⚠ Error asegurando columna phone:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("WARNING: ensure_users_phone_column() skipped:", str(e))
     finally:
-        cur.close()
-        conn.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # 🔥 EJECUTAR AL ARRANCAR LA APP
@@ -1209,6 +1393,31 @@ button {
 def login():
 
     if request.method == "POST":
+        if DEMO_MODE:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "").strip()
+
+            if username == "admin" and password == "admin":
+                session.clear()
+                session["demo_user"] = {
+                    "id": 0,
+                    "username": "admin",
+                    "role": "admin",
+                    "phone": "",
+                    "name": "Admin Demo",
+                }
+                flash("Modo demo: datos no se guardan (sin base de datos).", "warning")
+                return redirect(url_for("demo_dashboard"))
+
+            flash("Usuario o contraseña incorrectos.", "danger")
+            return render_template_string(
+                TPL_LOGIN,
+                flashes=get_flashed_messages(with_categories=True),
+                app_brand=APP_BRAND,
+                admin_whatsapp=ADMIN_WHATSAPP,
+            )
+
+        # Normal mode: requires DB
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
 
@@ -1258,6 +1467,242 @@ def login():
         flashes=get_flashed_messages(with_categories=True),
         app_brand=APP_BRAND,
         admin_whatsapp=ADMIN_WHATSAPP
+    )
+
+
+@app.route("/demo")
+@login_required
+def demo_dashboard():
+    user = current_user()
+    body = """
+    <div class="card">
+      <h2>Modo demo (sin base de datos)</h2>
+      <p>Estás viendo la app sin PostgreSQL. Puedes navegar la interfaz, pero <b>no se guardará nada</b>.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+        <a class="btn btn-primary" href="/demo/clients">Clientes (demo)</a>
+        <a class="btn btn-primary" href="/demo/loans">Préstamos (demo)</a>
+        <a class="btn btn-secondary" href="/time">Ver hora (RD)</a>
+        <a class="btn btn-secondary" href="/logout">Cerrar sesión</a>
+      </div>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/clients")
+@login_required
+def demo_clients():
+    user = current_user()
+    rows = DEMO_DB["clients"]
+
+    trs = ""
+    for c in rows:
+        trs += f"""
+        <tr>
+          <td>{c["id"]}</td>
+          <td>{c.get("first_name","")}</td>
+          <td>{c.get("last_name","")}</td>
+          <td>{c.get("phone","")}</td>
+          <td>{c.get("created_at","")}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h2>Clientes (demo)</h2>
+      <p style="margin-top:-6px;color:#475569;">Estos datos son temporales (se borran al reiniciar).</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
+        <a class="btn btn-primary" href="/demo/clients/new">+ Nuevo cliente</a>
+        <a class="btn btn-secondary" href="/demo">Volver</a>
+      </div>
+      <table>
+        <tr><th>ID</th><th>Nombre</th><th>Apellido</th><th>Teléfono</th><th>Creado</th></tr>
+        {trs if trs else "<tr><td colspan='5' style='text-align:center;'>No hay clientes</td></tr>"}
+      </table>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/clients/new", methods=["GET", "POST"])
+@login_required
+def demo_clients_new():
+    user = current_user()
+    if request.method == "POST":
+        first_name = (request.form.get("first_name") or "").strip()
+        last_name = (request.form.get("last_name") or "").strip()
+        phone = (request.form.get("phone") or "").strip()
+        address = (request.form.get("address") or "").strip()
+
+        if not first_name:
+            flash("Nombre requerido.", "danger")
+        else:
+            cid = _demo_next_id("clients")
+            DEMO_DB["clients"].append(
+                {
+                    "id": cid,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "phone": phone,
+                    "address": address,
+                    "created_at": now_dr().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            flash("Cliente creado (demo).", "success")
+            return redirect(url_for("demo_clients"))
+
+    body = """
+    <div class="card">
+      <h2>+ Nuevo cliente (demo)</h2>
+      <form method="post" style="display:grid;gap:10px;max-width:520px;">
+        <div><label>Nombre</label><input name="first_name" required></div>
+        <div><label>Apellido</label><input name="last_name"></div>
+        <div><label>Teléfono</label><input name="phone" placeholder="8091234567"></div>
+        <div><label>Dirección</label><input name="address"></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+          <button class="btn btn-primary" type="submit">Guardar</button>
+          <a class="btn btn-secondary" href="/demo/clients">Cancelar</a>
+        </div>
+      </form>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/loans")
+@login_required
+def demo_loans():
+    user = current_user()
+    clients_by_id = {c["id"]: c for c in DEMO_DB["clients"]}
+
+    trs = ""
+    for l in DEMO_DB["loans"]:
+        c = clients_by_id.get(l["client_id"], {})
+        name = (c.get("first_name", "") + " " + c.get("last_name", "")).strip() or "Cliente"
+        trs += f"""
+        <tr>
+          <td>{l["id"]}</td>
+          <td>{name}</td>
+          <td>{fmt_money(l.get("amount"))}</td>
+          <td>{l.get("start_date","")}</td>
+          <td>{l.get("status","activo")}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h2>Préstamos (demo)</h2>
+      <p style="margin-top:-6px;color:#475569;">Temporales (se borran al reiniciar).</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
+        <a class="btn btn-primary" href="/demo/loans/new">+ Nuevo préstamo</a>
+        <a class="btn btn-secondary" href="/demo">Volver</a>
+      </div>
+      <table>
+        <tr><th>ID</th><th>Cliente</th><th>Monto</th><th>Inicio</th><th>Status</th></tr>
+        {trs if trs else "<tr><td colspan='5' style='text-align:center;'>No hay préstamos</td></tr>"}
+      </table>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/loans/new", methods=["GET", "POST"])
+@login_required
+def demo_loans_new():
+    user = current_user()
+    clients = DEMO_DB["clients"]
+
+    if request.method == "POST":
+        client_id = int(request.form.get("client_id") or "0")
+        amount_raw = (request.form.get("amount") or "").strip()
+
+        try:
+            amount = float(amount_raw)
+        except Exception:
+            amount = None
+
+        if not client_id:
+            flash("Seleccione un cliente.", "danger")
+        elif amount is None or amount <= 0:
+            flash("Monto inválido.", "danger")
+        else:
+            lid = _demo_next_id("loans")
+            DEMO_DB["loans"].append(
+                {
+                    "id": lid,
+                    "client_id": client_id,
+                    "amount": amount,
+                    "start_date": now_dr().strftime("%Y-%m-%d"),
+                    "status": "activo",
+                }
+            )
+            flash("Préstamo creado (demo).", "success")
+            return redirect(url_for("demo_loans"))
+
+    options = "<option value=''>-- Seleccionar --</option>"
+    for c in clients:
+        label = (c.get("first_name", "") + " " + c.get("last_name", "")).strip() or f"Cliente {c['id']}"
+        options += f"<option value='{c['id']}'>{label}</option>"
+
+    body = f"""
+    <div class="card">
+      <h2>+ Nuevo préstamo (demo)</h2>
+      <form method="post" style="display:grid;gap:10px;max-width:520px;">
+        <div>
+          <label>Cliente</label>
+          <select name="client_id" required>{options}</select>
+          <div style="margin-top:6px;">
+            <a href="/demo/clients/new" style="font-size:13px;">Crear cliente primero</a>
+          </div>
+        </div>
+        <div><label>Monto</label><input name="amount" inputmode="decimal" placeholder="1000" required></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+          <button class="btn btn-primary" type="submit">Guardar</button>
+          <a class="btn btn-secondary" href="/demo/loans">Cancelar</a>
+        </div>
+      </form>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
     )
 
 
@@ -1315,8 +1760,9 @@ def dashboard():
             (SELECT COUNT(*) FROM loans WHERE UPPER(status)='ACTIVO' {user_filter_sql}) AS active_loans,
 
             (
-                SELECT COALESCE(SUM(l.remaining),0)
-                     - COALESCE(SUM(l.total_interest - l.total_interest_paid),0)
+                SELECT COALESCE(SUM(
+                    l.remaining - (COALESCE(l.total_interest,0) - COALESCE(l.total_interest_paid,0))
+                ),0)
                 FROM loans l
                 WHERE UPPER(l.status)='ACTIVO' {user_filter_sql}
             ) AS capital,
@@ -1330,10 +1776,12 @@ def dashboard():
             (
                 SELECT COALESCE(SUM(interest),0)
                 FROM payments
-                WHERE status <> 'ANULADO'
+                WHERE COALESCE(status,'') <> 'ANULADO'
+                AND EXTRACT(YEAR FROM date) = EXTRACT(YEAR FROM CURRENT_DATE)
                 {f"AND created_by = {user['id']}" if user["role"]=="cobrador" else ""}
             ) AS interes_pagado,
-                         (
+			
+            (
                 SELECT COALESCE(SUM(amount),0)
                 FROM payments
                 WHERE DATE(date)=CURRENT_DATE
@@ -1374,12 +1822,12 @@ def dashboard():
             (
                 SELECT COALESCE(SUM(amount),0)
                 FROM payments
-                WHERE status <> 'ANULADO'
-                AND DATE_TRUNC('year', date)=DATE_TRUNC('year', CURRENT_DATE)
+                WHERE COALESCE(status,'') <> 'ANULADO'
+                AND EXTRACT(YEAR FROM date) = EXTRACT(YEAR FROM CURRENT_DATE)
                 {f"AND created_by = {user['id']}" if user["role"]=="cobrador" else ""}
             ) AS kpi_anual
         """
-
+		
         cur.execute(query)
         row = cur.fetchone()
 
@@ -1641,6 +2089,14 @@ def dashboard():
 <div class="kpi-icon">📚</div>
 <div class="kpi-title">Cuadres Cerrados</div>
 <div class="value">Historial</div>
+</div>
+</a>
+
+<a href="/bank/historial-depositos" class="kpi-link">
+<div class="kpi-card" style="background:#2563eb;color:white">
+<div class="kpi-icon">🏦</div>
+<div class="kpi-title">Historial Depósitos</div>
+<div class="value">Admin</div>
 </div>
 </a>
 
@@ -1927,7 +2383,7 @@ def new_user():
             cur.execute("""
                 INSERT INTO users (username, password_hash, role, phone, created_at)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (username, pwd, role, phone, datetime.utcnow()))
+            """, (username, pwd, role, phone, now_dr()))
             conn.commit()
             flash("Usuario creado correctamente.", "success")
 
@@ -2218,7 +2674,10 @@ def clients():
         f"""
         <div class="client-glass-card"
              onclick="window.location='/clients/{c['id']}'">
-          <div class="client-avatar">👤</div>
+          <div class="client-avatar">
+            <img src="{c.get('photo') or '/static/no-photo.png'}"
+                 style="width:100%;height:100%;object-fit:cover;border-radius:50%;">
+          </div>
           <div class="client-info">
             <div class="client-name">
               {c.get('first_name','')} {c.get('last_name','')}
@@ -2371,24 +2830,65 @@ def edit_client(client_id):
     cur = conn.cursor()
 
     if request.method == "POST":
-        cur.execute("""
-            UPDATE clients
-            SET first_name=%s,
-                last_name=%s,
-                phone=%s,
-                address=%s,
-                document_id=%s,
-                route=%s
-            WHERE id=%s
-        """, (
-            request.form["first_name"],
-            request.form["last_name"],
-            request.form["phone"],
-            request.form["address"],
-            request.form["document_id"],
-            request.form["route"],
-            client_id
-        ))
+
+        # ===============================
+        # GUARDAR FOTO
+        # ===============================
+        photo = request.files.get("photo")
+        photo_path = None
+
+        if photo and photo.filename:
+            filename = secure_filename(photo.filename)
+            filename = f"{int(time.time())}_{filename}"
+
+            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            photo.save(filepath)
+
+            photo_path = "/" + filepath
+
+        # ===============================
+        # ACTUALIZAR CLIENTE
+        # ===============================
+        if photo_path:
+            cur.execute("""
+                UPDATE clients
+                SET first_name=%s,
+                    last_name=%s,
+                    phone=%s,
+                    address=%s,
+                    document_id=%s,
+                    route=%s,
+                    photo=%s
+                WHERE id=%s
+            """, (
+                request.form["first_name"],
+                request.form["last_name"],
+                request.form["phone"],
+                request.form["address"],
+                request.form["document_id"],
+                request.form["route"],
+                photo_path,
+                client_id
+            ))
+        else:
+            cur.execute("""
+                UPDATE clients
+                SET first_name=%s,
+                    last_name=%s,
+                    phone=%s,
+                    address=%s,
+                    document_id=%s,
+                    route=%s
+                WHERE id=%s
+            """, (
+                request.form["first_name"],
+                request.form["last_name"],
+                request.form["phone"],
+                request.form["address"],
+                request.form["document_id"],
+                request.form["route"],
+                client_id
+            ))
 
         conn.commit()
         cur.close()
@@ -2402,12 +2902,18 @@ def edit_client(client_id):
 
     cur.close()
     conn.close()
-
+	
     body = f"""
     <div class="card">
-      <h2>✏️ Editar cliente</h2>
 
-      <form method="post">
+    <div style="position:absolute; right:20px; top:20px;">
+        <img src="{client['photo'] if client['photo'] else url_for('static', filename='no-photo.png')}"
+            style="width:150px;height:150px;border-radius:12px;object-fit:cover;border:1px solid #ccc;">
+    </div>
+
+    <h2>✏️ Editar cliente</h2>
+
+    <form method="post" enctype="multipart/form-data">
         <input name="first_name" value="{client['first_name']}" required placeholder="Nombre">
         <input name="last_name" value="{client['last_name']}" required placeholder="Apellido">
         <input name="phone" value="{client['phone']}" placeholder="Teléfono">
@@ -2415,10 +2921,14 @@ def edit_client(client_id):
         <input name="document_id" value="{client['document_id']}" placeholder="Documento">
         <input name="route" value="{client.get('route','')}" placeholder="Ruta">
 
+        <label>📸 Foto del cliente</label>
+        <input type="file" name="photo" accept="image/*" capture="environment">
+
         <button class="btn btn-primary">💾 Guardar cambios</button>
         <a href="{url_for('client_detail', client_id=client_id)}"
-           class="btn btn-secondary">Cancelar</a>
-      </form>
+            class="btn btn-secondary">Cancelar</a>
+    </form>
+
     </div>
     """
 
@@ -2453,13 +2963,42 @@ def new_client():
             flash("El nombre es obligatorio.", "danger")
             return redirect("/clients/new")
 
+        # ===============================
+        # GUARDAR FOTO
+        # ===============================
+        photo = request.files.get("photo")
+        photo_path = None
+
+        if photo and photo.filename:
+            filename = secure_filename(photo.filename)
+            filename = f"{int(time.time())}_{filename}"
+
+            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            photo.save(filepath)
+
+            photo_path = "/" + filepath
+
+        # ===============================
+        # GUARDAR CLIENTE
+        # ===============================
         conn = get_conn()
         cur = conn.cursor()
+
         cur.execute("""
             INSERT INTO clients
-            (first_name, last_name, document_id, phone, address, route, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (first, last, document_id, phone, address, route, user["id"]))
+            (first_name, last_name, document_id, phone, address, route, created_by, photo)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            first,
+            last,
+            document_id,
+            phone,
+            address,
+            route,
+            user["id"],
+            photo_path
+        ))
+
         conn.commit()
         cur.close()
         conn.close()
@@ -2471,7 +3010,7 @@ def new_client():
     <div class="card">
       <h2>➕ Nuevo cliente</h2>
 
-      <form method="post">
+      <form method="post" enctype="multipart/form-data">
         <label>Nombre</label>
         <input name="first_name" required>
 
@@ -2489,6 +3028,9 @@ def new_client():
 
         <label>Ruta</label>
         <input name="route">
+
+		<label>Foto del cliente</label>
+        <input type="file" name="photo" accept="image/*" capture="environment">
 
         <button class="btn btn-primary" style="margin-top:10px;">
           Guardar
@@ -2657,16 +3199,45 @@ def client_detail(client_id):
     # ===============================
     # HTML FINAL
     # ===============================
+    photo = client.get("photo") or "/static/no-photo.png"
+
     body = f"""
     <div class="card">
-      <h2>Cliente {client['first_name']} {client['last_name']}</h2>
-      <p>Tel: {client['phone']}</p>
-      <p>Dirección: {client['address']}</p>
-      <p>Documento: {client['document_id']}</p>
-      <p>Ruta: {client.get('route','')}</p>
+      <div style="
+        display:flex;
+        justify-content:space-between;
+        align-items:flex-start;
+        gap:30px;
+      ">
 
-      {actions_block}
-      {reassign_block}
+        <div>
+          <h2>Cliente {client['first_name']} {client['last_name']}</h2>
+          <p>Tel: {client['phone']}</p>
+          <p>Dirección: {client['address']}</p>
+          <p>Documento: {client['document_id']}</p>
+          <p>Ruta: {client.get('route','')}</p>
+
+          {actions_block}
+          {reassign_block}
+        </div>
+
+        <div style="
+          width:160px;
+          height:180px;
+          border-radius:12px;
+          overflow:hidden;
+          border:3px solid #e3e3e3;
+          background:#f5f5f5;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+        ">
+          <img src="{photo}"
+               style="width:100%;height:100%;object-fit:cover;">
+        </div>
+
+      </div>
+
     </div>
 
     <div class="card">
@@ -3298,8 +3869,10 @@ def loans():
 
 from datetime import datetime, date
 
-
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 # ============================================================
 # 💰 CREAR PRÉSTAMO — FINANCIERO REAL CORREGIDO
@@ -5152,8 +5725,10 @@ def bank_legal_list():
 
 from flask import Response
 
-
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 # ============================================================
 # 📄 VER DOCUMENTO LEGAL + CÉDULA + FIRMA (TODO EN BD)
@@ -8902,7 +9477,10 @@ def collector_map():
 
 from datetime import date, timedelta
 from flask import render_template_string, get_flashed_messages
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 
 @app.route("/bank/cobro-sabado")
 @login_required
@@ -9645,7 +10223,10 @@ def borrar_cierre(cierre_id):
 # ============================================================
 
 import os
-from psycopg2.extras import RealDictCursor
+try:
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    RealDictCursor = None
 from flask import request, redirect, flash, render_template_string, get_flashed_messages
 
 
@@ -9841,7 +10422,7 @@ def historial_depositos():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     cur.execute("""
-        SELECT cr.*, u.name
+        SELECT cr.*, u.username
         FROM cash_reports cr
         LEFT JOIN users u ON u.id = cr.user_id
         WHERE cr.movement_type='deposito_admin'
@@ -9867,7 +10448,7 @@ def historial_depositos():
             trs += f"""
             <tr>
                 <td>{r["created_at"]}</td>
-                <td>{r.get("name","Admin")}</td>
+                <td>{r.get("username","Admin")}</td>
                 <td>{fmt_money(r["amount"])}</td>
                 <td>{r["note"]}</td>
             </tr>
@@ -9961,7 +10542,7 @@ def admin_force_create():
         "admin",
         generate_password_hash("admin"),
         "admin",
-        datetime.utcnow()
+        now_dr()
     ))
 
     conn.commit()
@@ -10032,18 +10613,6 @@ def delete_advance(payment_id):
 if __name__ == "__main__":
     print("[JDM Cash Now] Iniciando servidor…")
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -101,6 +101,9 @@ DEMO_DB = {
     "clients": [],  # {id, first_name, last_name, phone, address, created_at}
     "loans": [],    # {id, client_id, amount, start_date, status}
     "users": [],    # {id, username, password_hash, role, phone, created_at, name}
+    "cash_reports": [],
+    "payments": [],
+    "initial_discounts": [],
 }
 
 # Demo metrics (showcase) for no-database mode.
@@ -298,6 +301,12 @@ class FakeCursor:
             self._rows = [{"c": len(DEMO_DB.get("users", []))}]
             return
 
+        # Simple bank balance query used by /loans/new
+        if "select coalesce(sum(amount),0) as total from cash_reports" in s:
+            total = sum(float(r.get("amount") or 0) for r in DEMO_DB.get("cash_reports", []))
+            self._rows = [{"total": total}]
+            return
+
         if "select * from users where username" in s:
             username = params[0] if params else ""
             for u in DEMO_DB.setdefault("users", []):
@@ -337,6 +346,141 @@ class FakeCursor:
                 }
             )
             self._rows = []
+            return
+
+        # Clients
+        if s.startswith("insert into clients"):
+            clients = DEMO_DB.setdefault("clients", [])
+            cid = _demo_next_id("clients")
+            # Supports both 7-col and 8-col inserts
+            first_name = params[0] if len(params) > 0 else ""
+            last_name = params[1] if len(params) > 1 else ""
+            document_id = params[2] if len(params) > 2 else ""
+            phone = params[3] if len(params) > 3 else ""
+            address = params[4] if len(params) > 4 else ""
+            route = params[5] if len(params) > 5 else ""
+            created_by = params[6] if len(params) > 6 else 1
+            clients.append(
+                {
+                    "id": cid,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "document_id": document_id,
+                    "phone": phone,
+                    "address": address,
+                    "route": route,
+                    "created_by": created_by,
+                    "created_at": now_dr(),
+                }
+            )
+            self._rows = []
+            return
+
+        if "select id, first_name, last_name from clients order by first_name" in s:
+            rows = sorted(
+                [
+                    {"id": c["id"], "first_name": c.get("first_name", ""), "last_name": c.get("last_name", "")}
+                    for c in DEMO_DB.get("clients", [])
+                ],
+                key=lambda x: (x.get("first_name", ""), x.get("last_name", "")),
+            )
+            self._rows = rows
+            return
+
+        if "select id, first_name, last_name from clients" in s and "where created_by=%s" in s:
+            uid = params[0] if params else None
+            rows = [
+                {"id": c["id"], "first_name": c.get("first_name", ""), "last_name": c.get("last_name", "")}
+                for c in DEMO_DB.get("clients", [])
+                if c.get("created_by") == uid
+            ]
+            rows = sorted(rows, key=lambda x: (x.get("first_name", ""), x.get("last_name", "")))
+            self._rows = rows
+            return
+
+        if "select * from clients where created_by" in s:
+            uid = params[0] if params else None
+            rows = [c for c in DEMO_DB.get("clients", []) if c.get("created_by") == uid]
+            self._rows = sorted(rows, key=lambda x: x.get("id", 0), reverse=True)
+            return
+
+        if "select * from clients" in s and "order by id desc" in s:
+            self._rows = sorted(DEMO_DB.get("clients", []), key=lambda x: x.get("id", 0), reverse=True)
+            return
+
+        # Cash reports inserts (for loan creation movements)
+        if s.startswith("insert into cash_reports"):
+            cash = DEMO_DB.setdefault("cash_reports", [])
+            cid = _demo_next_id("cash_reports")
+            # Common forms:
+            # (user_id, movement_type, amount, note, created_at)
+            # (user_id, movement_type, amount, note, created_at, organization_id)
+            user_id = params[0] if len(params) > 0 else 1
+            movement_type = params[1] if len(params) > 1 else "mov"
+            amount = float(params[2]) if len(params) > 2 else 0.0
+            note = params[3] if len(params) > 3 else ""
+            cash.append(
+                {
+                    "id": cid,
+                    "user_id": user_id,
+                    "movement_type": movement_type,
+                    "amount": amount,
+                    "note": note,
+                    "created_at": now_dr(),
+                }
+            )
+            self._rows = []
+            return
+
+        # Loans insert for /loans/new ... RETURNING id
+        if s.startswith("insert into loans") and "returning id" in s:
+            loans = DEMO_DB.setdefault("loans", [])
+            lid = _demo_next_id("loans")
+            # Matches current insert order in new_loan()
+            loan = {
+                "id": lid,
+                "client_id": params[0] if len(params) > 0 else None,
+                "amount": float(params[1]) if len(params) > 1 else 0.0,
+                "rate": float(params[2]) if len(params) > 2 else 0.0,
+                "frequency": params[3] if len(params) > 3 else "semanal",
+                "start_date": params[4] if len(params) > 4 else date.today(),
+                "next_payment_date": params[5] if len(params) > 5 else date.today(),
+                "created_by": params[6] if len(params) > 6 else 1,
+                "remaining_capital": float(params[7]) if len(params) > 7 else 0.0,
+                "remaining": float(params[8]) if len(params) > 8 else 0.0,
+                "total_interest_paid": float(params[9]) if len(params) > 9 else 0.0,
+                "total_interest": float(params[10]) if len(params) > 10 else 0.0,
+                "total_to_pay": float(params[11]) if len(params) > 11 else 0.0,
+                "status": "activo",
+                "term_count": int(params[12]) if len(params) > 12 else 1,
+                "upfront_percent": float(params[13]) if len(params) > 13 else 0.0,
+                "installment_amount": float(params[14]) if len(params) > 14 else 0.0,
+            }
+            loans.append(loan)
+            self._rows = [{"id": lid}]
+            return
+
+        # Loans list query with clients join
+        if "from loans l join clients c on c.id = l.client_id" in s and "select l.id, l.remaining, l.status, l.frequency" in s:
+            by_user = "where l.created_by = %s" in s
+            uid = params[0] if (by_user and params) else None
+            clients_by_id = {c["id"]: c for c in DEMO_DB.get("clients", [])}
+            rows = []
+            for l in DEMO_DB.get("loans", []):
+                if by_user and l.get("created_by") != uid:
+                    continue
+                c = clients_by_id.get(l.get("client_id")) or {}
+                rows.append(
+                    {
+                        "id": l.get("id"),
+                        "remaining": l.get("remaining", 0),
+                        "status": l.get("status", "activo"),
+                        "frequency": l.get("frequency", "semanal"),
+                        "first_name": c.get("first_name", ""),
+                        "last_name": c.get("last_name", ""),
+                    }
+                )
+            self._rows = sorted(rows, key=lambda x: x.get("id", 0), reverse=True)
             return
 
         # Generic no-op: return empty set for SELECT, accept writes.

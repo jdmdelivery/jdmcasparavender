@@ -115,18 +115,18 @@ DEMO_DB = {
 
 # Demo metrics (showcase) for no-database mode.
 DEMO_METRICS = {
-    "total_clients": 39,
-    "active_loans": 39,
-    "capital": 111301.52,          # Capital pendiente
-    "total_en_calle": 144366.52,   # Total por cobrar
-    "interes_pagado": 23565.00,
-    "cobrado_hoy": 1950.00,
-    "interes_hoy": 450.00,
+    "total_clients": 0,
+    "active_loans": 0,
+    "capital": 0.0,
+    "total_en_calle": 0.0,
+    "interes_pagado": 0.0,
+    "cobrado_hoy": 0.0,
+    "interes_hoy": 0.0,
     "prestamos_atrasados": 0,
-    "kpi_semanal": 77198.48,       # Capital cobrado
-    "kpi_mensual": 33065.00,       # Interés pendiente
-    "kpi_anual": 188500.00,        # Capital prestado
-    "total_empleados": 2,
+    "kpi_semanal": 0.0,
+    "kpi_mensual": 0.0,
+    "kpi_anual": 0.0,
+    "total_empleados": 0,
 }
 
 # Seed demo admin (admin/admin) so login works without DB.
@@ -2078,6 +2078,21 @@ def dashboard():
 <div class="kpi-icon">👤</div>
 <div class="kpi-title">Clientes</div>
 <div class="value">{total_clients}</div>
+</div>
+</a>
+
+<a href="/loans/new" class="kpi-link">
+<div class="kpi-card" style="background:#22a6f2">
+<div class="kpi-icon">➕</div>
+<div class="kpi-title">Nuevo préstamo</div>
+<div class="value" style="font-size:13px;">Evaluación crédito</div>
+</div>
+</a>
+
+<a href="/bank/risk-clients" class="kpi-link">
+<div class="kpi-card kpi-deeppurple">
+<div class="kpi-icon">🎯</div>
+<div class="kpi-title">Score de cliente</div>
 </div>
 </a>
 

@@ -40,6 +40,7 @@ from flask import (
 )
 
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import HTTPException
 from functools import wraps
 
 # No-database mode: make all DB imports optional and never fatal.
@@ -112,6 +113,22 @@ DEMO_DB = {
     "users": [],    # {id, username, password_hash, role, phone, created_at, name}
 }
 
+# Demo metrics for no-database mode (neutral placeholders).
+DEMO_METRICS = {
+    "total_clients": 0,
+    "active_loans": 0,
+    "capital": 0.0,
+    "total_en_calle": 0.0,
+    "interes_pagado": 0.0,
+    "cobrado_hoy": 0.0,
+    "interes_hoy": 0.0,
+    "prestamos_atrasados": 0,
+    "kpi_semanal": 0.0,
+    "kpi_mensual": 0.0,
+    "kpi_anual": 0.0,
+    "total_empleados": 0,
+}
+
 # Seed demo admin (admin/admin) so login works without DB.
 if not any(u.get("username") == "admin" for u in DEMO_DB["users"]):
     DEMO_DB["users"].append(
@@ -143,6 +160,47 @@ class DatabaseNotConfigured(RuntimeError):
 def _handle_db_not_configured(_err):
     # In no-database mode, never block navigation.
     return redirect(url_for("demo_dashboard"))
+
+
+def _render_demo_module(path: str, status_code: int = 200):
+    title = path.strip("/") or "dashboard"
+    pretty = title.replace("-", " ").replace("/", " / ").title()
+    body = f"""
+    <div class="card">
+      <h2>{pretty} (Demo)</h2>
+      <p>Este módulo está visible en modo demo sin base de datos.</p>
+      <p>Aquí puedes mostrar flujo, diseño y botones sin guardar información real.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+        <a class="btn btn-primary" href="/dashboard">Ir al Dashboard</a>
+        <a class="btn btn-secondary" href="/demo/clients">Clientes Demo</a>
+        <a class="btn btn-secondary" href="/demo/loans">Préstamos Demo</a>
+      </div>
+    </div>
+    """
+    if "TPL_LAYOUT" in globals():
+        return (
+            render_template_string(
+                TPL_LAYOUT,
+                body=body,
+                user=current_user(),
+                flashes=get_flashed_messages(with_categories=True),
+                admin_whatsapp=ADMIN_WHATSAPP,
+                app_brand=APP_BRAND,
+                theme=get_theme(),
+            ),
+            status_code,
+        )
+    return (render_template_string(body), status_code)
+
+
+@app.errorhandler(Exception)
+def _demo_fallback_error_handler(err):
+    if not DEMO_MODE:
+        raise err
+    if isinstance(err, HTTPException):
+        return err
+    # Keep demo navigation alive even when legacy DB code path fails.
+    return _render_demo_module(request.path, 200)
 
 # Optional: quick timezone check
 @app.route("/time")
@@ -198,25 +256,27 @@ class FakeCursor:
 
         # Dashboard KPI mega-query: return a single row with expected keys.
         if "as total_clients" in s and "as active_loans" in s and "as kpi_anual" in s:
+            total_clients = len(DEMO_DB.get("clients", []))
+            active_loans = len(
+                [
+                    l
+                    for l in DEMO_DB.get("loans", [])
+                    if (l.get("status") or "activo").lower() == "activo"
+                ]
+            )
             self._rows = [
                 {
-                    "total_clients": len(DEMO_DB.get("clients", [])),
-                    "active_loans": len(
-                        [
-                            l
-                            for l in DEMO_DB.get("loans", [])
-                            if (l.get("status") or "activo").lower() == "activo"
-                        ]
-                    ),
-                    "capital": 0,
-                    "total_en_calle": 0,
-                    "interes_pagado": 0,
-                    "cobrado_hoy": 0,
-                    "interes_hoy": 0,
-                    "prestamos_atrasados": 0,
-                    "kpi_semanal": 0,
-                    "kpi_mensual": 0,
-                    "kpi_anual": 0,
+                    "total_clients": total_clients,
+                    "active_loans": active_loans,
+                    "capital": DEMO_METRICS["capital"],
+                    "total_en_calle": DEMO_METRICS["total_en_calle"],
+                    "interes_pagado": DEMO_METRICS["interes_pagado"],
+                    "cobrado_hoy": DEMO_METRICS["cobrado_hoy"],
+                    "interes_hoy": DEMO_METRICS["interes_hoy"],
+                    "prestamos_atrasados": DEMO_METRICS["prestamos_atrasados"],
+                    "kpi_semanal": DEMO_METRICS["kpi_semanal"],
+                    "kpi_mensual": DEMO_METRICS["kpi_mensual"],
+                    "kpi_anual": DEMO_METRICS["kpi_anual"],
                 }
             ]
             return

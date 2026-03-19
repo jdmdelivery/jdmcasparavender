@@ -113,20 +113,20 @@ DEMO_DB = {
     "users": [],    # {id, username, password_hash, role, phone, created_at, name}
 }
 
-# Demo metrics for no-database mode (neutral placeholders).
+# Demo metrics (showcase) for no-database mode.
 DEMO_METRICS = {
-    "total_clients": 0,
-    "active_loans": 0,
-    "capital": 0.0,
-    "total_en_calle": 0.0,
-    "interes_pagado": 0.0,
-    "cobrado_hoy": 0.0,
-    "interes_hoy": 0.0,
+    "total_clients": 39,
+    "active_loans": 39,
+    "capital": 111301.52,          # Capital pendiente
+    "total_en_calle": 144366.52,   # Total por cobrar
+    "interes_pagado": 23565.00,
+    "cobrado_hoy": 1950.00,
+    "interes_hoy": 450.00,
     "prestamos_atrasados": 0,
-    "kpi_semanal": 0.0,
-    "kpi_mensual": 0.0,
-    "kpi_anual": 0.0,
-    "total_empleados": 0,
+    "kpi_semanal": 77198.48,       # Capital cobrado
+    "kpi_mensual": 33065.00,       # Interés pendiente
+    "kpi_anual": 188500.00,        # Capital prestado
+    "total_empleados": 2,
 }
 
 # Seed demo admin (admin/admin) so login works without DB.
@@ -256,18 +256,10 @@ class FakeCursor:
 
         # Dashboard KPI mega-query: return a single row with expected keys.
         if "as total_clients" in s and "as active_loans" in s and "as kpi_anual" in s:
-            total_clients = len(DEMO_DB.get("clients", []))
-            active_loans = len(
-                [
-                    l
-                    for l in DEMO_DB.get("loans", [])
-                    if (l.get("status") or "activo").lower() == "activo"
-                ]
-            )
             self._rows = [
                 {
-                    "total_clients": total_clients,
-                    "active_loans": active_loans,
+                    "total_clients": DEMO_METRICS["total_clients"],
+                    "active_loans": DEMO_METRICS["active_loans"],
                     "capital": DEMO_METRICS["capital"],
                     "total_en_calle": DEMO_METRICS["total_en_calle"],
                     "interes_pagado": DEMO_METRICS["interes_pagado"],
@@ -283,13 +275,7 @@ class FakeCursor:
 
         # COUNT cobradores used on dashboard
         if "select count(*) as total from users where role='cobrador'" in s:
-            self._rows = [
-                {
-                    "total": len(
-                        [u for u in DEMO_DB.get("users", []) if u.get("role") == "cobrador"]
-                    )
-                }
-            ]
+            self._rows = [{"total": DEMO_METRICS["total_empleados"]}]
             return
 
         # Generic COUNT(*) AS total pattern used across screens

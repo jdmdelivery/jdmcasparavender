@@ -108,6 +108,16 @@ else:
 # When no PostgreSQL is configured, enable a lightweight demo mode.
 DEMO_MODE = DATABASE_URL_IS_FALLBACK or (psycopg2 is None)
 
+# In-memory demo storage (no external DB). Resets on deploy/restart.
+DEMO_DB = {
+    "clients": [],  # {id, first_name, last_name, phone, address, created_at}
+    "loans": [],    # {id, client_id, amount, start_date, status}
+}
+
+def _demo_next_id(table: str) -> int:
+    rows = DEMO_DB.get(table, [])
+    return (max((r["id"] for r in rows), default=0) + 1) if rows else 1
+
 # =============================
 # CREAR APP FLASK
 # =============================
@@ -1402,9 +1412,220 @@ def demo_dashboard():
       <h2>Modo demo (sin base de datos)</h2>
       <p>Estás viendo la app sin PostgreSQL. Puedes navegar la interfaz, pero <b>no se guardará nada</b>.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
-        <a class="btn btn-primary" href="/time">Ver hora (RD)</a>
+        <a class="btn btn-primary" href="/demo/clients">Clientes (demo)</a>
+        <a class="btn btn-primary" href="/demo/loans">Préstamos (demo)</a>
+        <a class="btn btn-secondary" href="/time">Ver hora (RD)</a>
         <a class="btn btn-secondary" href="/logout">Cerrar sesión</a>
       </div>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/clients")
+@login_required
+def demo_clients():
+    user = current_user()
+    rows = DEMO_DB["clients"]
+
+    trs = ""
+    for c in rows:
+        trs += f"""
+        <tr>
+          <td>{c["id"]}</td>
+          <td>{c.get("first_name","")}</td>
+          <td>{c.get("last_name","")}</td>
+          <td>{c.get("phone","")}</td>
+          <td>{c.get("created_at","")}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h2>Clientes (demo)</h2>
+      <p style="margin-top:-6px;color:#475569;">Estos datos son temporales (se borran al reiniciar).</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
+        <a class="btn btn-primary" href="/demo/clients/new">+ Nuevo cliente</a>
+        <a class="btn btn-secondary" href="/demo">Volver</a>
+      </div>
+      <table>
+        <tr><th>ID</th><th>Nombre</th><th>Apellido</th><th>Teléfono</th><th>Creado</th></tr>
+        {trs if trs else "<tr><td colspan='5' style='text-align:center;'>No hay clientes</td></tr>"}
+      </table>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/clients/new", methods=["GET", "POST"])
+@login_required
+def demo_clients_new():
+    user = current_user()
+    if request.method == "POST":
+        first_name = (request.form.get("first_name") or "").strip()
+        last_name = (request.form.get("last_name") or "").strip()
+        phone = (request.form.get("phone") or "").strip()
+        address = (request.form.get("address") or "").strip()
+
+        if not first_name:
+            flash("Nombre requerido.", "danger")
+        else:
+            cid = _demo_next_id("clients")
+            DEMO_DB["clients"].append(
+                {
+                    "id": cid,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "phone": phone,
+                    "address": address,
+                    "created_at": now_dr().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            flash("Cliente creado (demo).", "success")
+            return redirect(url_for("demo_clients"))
+
+    body = """
+    <div class="card">
+      <h2>+ Nuevo cliente (demo)</h2>
+      <form method="post" style="display:grid;gap:10px;max-width:520px;">
+        <div><label>Nombre</label><input name="first_name" required></div>
+        <div><label>Apellido</label><input name="last_name"></div>
+        <div><label>Teléfono</label><input name="phone" placeholder="8091234567"></div>
+        <div><label>Dirección</label><input name="address"></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+          <button class="btn btn-primary" type="submit">Guardar</button>
+          <a class="btn btn-secondary" href="/demo/clients">Cancelar</a>
+        </div>
+      </form>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/loans")
+@login_required
+def demo_loans():
+    user = current_user()
+    clients_by_id = {c["id"]: c for c in DEMO_DB["clients"]}
+
+    trs = ""
+    for l in DEMO_DB["loans"]:
+        c = clients_by_id.get(l["client_id"], {})
+        name = (c.get("first_name", "") + " " + c.get("last_name", "")).strip() or "Cliente"
+        trs += f"""
+        <tr>
+          <td>{l["id"]}</td>
+          <td>{name}</td>
+          <td>{fmt_money(l.get("amount"))}</td>
+          <td>{l.get("start_date","")}</td>
+          <td>{l.get("status","activo")}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h2>Préstamos (demo)</h2>
+      <p style="margin-top:-6px;color:#475569;">Temporales (se borran al reiniciar).</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
+        <a class="btn btn-primary" href="/demo/loans/new">+ Nuevo préstamo</a>
+        <a class="btn btn-secondary" href="/demo">Volver</a>
+      </div>
+      <table>
+        <tr><th>ID</th><th>Cliente</th><th>Monto</th><th>Inicio</th><th>Status</th></tr>
+        {trs if trs else "<tr><td colspan='5' style='text-align:center;'>No hay préstamos</td></tr>"}
+      </table>
+    </div>
+    """
+    return render_template_string(
+        TPL_LAYOUT,
+        body=body,
+        user=user,
+        flashes=get_flashed_messages(with_categories=True),
+        admin_whatsapp=ADMIN_WHATSAPP,
+        app_brand=APP_BRAND,
+        theme=get_theme(),
+    )
+
+
+@app.route("/demo/loans/new", methods=["GET", "POST"])
+@login_required
+def demo_loans_new():
+    user = current_user()
+    clients = DEMO_DB["clients"]
+
+    if request.method == "POST":
+        client_id = int(request.form.get("client_id") or "0")
+        amount_raw = (request.form.get("amount") or "").strip()
+
+        try:
+            amount = float(amount_raw)
+        except Exception:
+            amount = None
+
+        if not client_id:
+            flash("Seleccione un cliente.", "danger")
+        elif amount is None or amount <= 0:
+            flash("Monto inválido.", "danger")
+        else:
+            lid = _demo_next_id("loans")
+            DEMO_DB["loans"].append(
+                {
+                    "id": lid,
+                    "client_id": client_id,
+                    "amount": amount,
+                    "start_date": now_dr().strftime("%Y-%m-%d"),
+                    "status": "activo",
+                }
+            )
+            flash("Préstamo creado (demo).", "success")
+            return redirect(url_for("demo_loans"))
+
+    options = "<option value=''>-- Seleccionar --</option>"
+    for c in clients:
+        label = (c.get("first_name", "") + " " + c.get("last_name", "")).strip() or f"Cliente {c['id']}"
+        options += f"<option value='{c['id']}'>{label}</option>"
+
+    body = f"""
+    <div class="card">
+      <h2>+ Nuevo préstamo (demo)</h2>
+      <form method="post" style="display:grid;gap:10px;max-width:520px;">
+        <div>
+          <label>Cliente</label>
+          <select name="client_id" required>{options}</select>
+          <div style="margin-top:6px;">
+            <a href="/demo/clients/new" style="font-size:13px;">Crear cliente primero</a>
+          </div>
+        </div>
+        <div><label>Monto</label><input name="amount" inputmode="decimal" placeholder="1000" required></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+          <button class="btn btn-primary" type="submit">Guardar</button>
+          <a class="btn btn-secondary" href="/demo/loans">Cancelar</a>
+        </div>
+      </form>
     </div>
     """
     return render_template_string(
